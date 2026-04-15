@@ -43,10 +43,11 @@ class ReplayDataSet(object):
                 next_state), np.array(
                 is_terminal, dtype=np.int8)
 
-    def build_full_view(self, maze: Maze):
+    def build_full_view(self, maze: Maze, state_extractor=None):
         """
             金手指，获取迷宫全图视野的数据集
             :param maze: 由Maze类实例化的对象
+            :param state_extractor: 获取特征的函数
         """
         maze_copy = copy.deepcopy(maze)
         maze_size = maze_copy.maze_size
@@ -61,7 +62,10 @@ class ReplayDataSet(object):
                     reward = maze_copy.move_robot(action)
                     next_state = maze_copy.sense_robot()
                     is_terminal = 1 if next_state == maze_copy.destination else 0
-                    self.add(state, action_index, reward, next_state, is_terminal)
+                    
+                    s = state_extractor(state) if state_extractor else state
+                    ns = state_extractor(next_state) if state_extractor else next_state
+                    self.add(s, action_index, reward, ns, is_terminal)
         self.full_dataset = list(self.Experience.values())
 
     def __getitem__(self, item):

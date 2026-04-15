@@ -34,7 +34,12 @@ class Runner(object):
         """
         获取给定状态的 Q 值向量，兼容 DQN 与 Q-table。
         """
-        normalized_state = np.array(state, dtype=np.float32)
+        # 如果 robot 有 get_state_feature 方法，则将其转换为扩展状态特征
+        if hasattr(self.robot, 'get_state_feature'):
+            feature_state = self.robot.get_state_feature(state)
+            normalized_state = np.array(feature_state, dtype=np.float32)
+        else:
+            normalized_state = np.array(state, dtype=np.float32)
 
         # DQN: 优先使用 target_model（测试更稳定）
         if use_target_model and hasattr(self.robot, 'target_model'):
@@ -73,6 +78,7 @@ class Runner(object):
             'r': 'R',
             'd': 'D',
             'l': 'L',
+            's': 'S',
         }
 
         for row in range(self.maze.maze_size):
@@ -269,6 +275,7 @@ class Runner(object):
                     'id': [e, i],
                     'success': False,
                     'state': self.maze.sense_robot(),
+                    'maze_data': np.array(self.maze.maze_data, copy=True),
                 }
 
                 if current_record['state'] == self.maze.destination:
@@ -279,6 +286,7 @@ class Runner(object):
                 action, reward = self.robot.train_update()
                 current_record['action'] = action
                 current_record['reward'] = reward
+                current_record['maze_data'] = np.array(self.maze.maze_data, copy=True)
                 self.train_robot_record.append(current_record)
 
                 run_times += 1
@@ -324,6 +332,7 @@ class Runner(object):
                     'id': [epoch_id, i],
                     'success': False,
                     'state': self.maze.sense_robot(),
+                    'maze_data': np.array(self.maze.maze_data, copy=True),
                 }
 
                 if current_record['state'] == self.maze.destination:
@@ -334,10 +343,11 @@ class Runner(object):
                 action, reward = self.robot.test_update()
                 current_record['action'] = action
                 current_record['reward'] = reward
+                current_record['maze_data'] = np.array(self.maze.maze_data, copy=True)
                 self.test_robot_record.append(current_record)
 
                 run_times += 1
-                accumulated_reward += reward
+                accumulated_reward += reward * (self.robot.gamma ** i)
 
             self.add_test_statics(accumulated_reward, run_times)
 
@@ -350,47 +360,49 @@ class Runner(object):
                 )
 
     def __init_gif(self):
-        self.maze.draw_maze()
-        fig = plt.gcf()
-        ax = plt.gca()
-        robot = plt.Circle((0, 0), 0.5, color="red")
-        x, y = self.maze.robot['loc'][0] + 0.5, self.maze.robot['loc'][1] + 0.5
-        robot.center = (y, x)
-        ax.add_patch(robot)
-
-        text_epoch = ax.text(
-            0, -0.1,
-            '',
-            fontsize=20,
-            horizontalalignment='left',
-            verticalalignment="bottom"
-        )
-
-        text_step = ax.text(
-            self.maze.maze_size, -0.1,
-            '',
-            fontsize=20,
-            horizontalalignment='right',
-            verticalalignment="bottom",
-        )
-        return fig, ax, robot, text_epoch, text_step
+        fig, ax = plt.subplots(figsize=(6, 6))
+        return fig, ax
 
     def generate_gif(self, filename):
-        fig, ax, robot, text_epoch, text_step = self.__init_gif()
+        fig, ax = self.__init_gif()
         p_bar = tqdm(
-            total=len(self.train_robot_record),
-            desc="正在将训练过程转换为gif图, 请耐心等候...",
+            total=len(self.test_robot_record),
+            desc="正在将测试过程转换为gif图, 请耐心等候...",
         )
 
-        def update(record):
-            x, y = record['state'][0] + 0.5, record['state'][1] + 0.5
-            robot.center = (y, x)
+        maze_backup = np.array(self.maze.maze_data, copy=True)
 
-            text_epoch.set_text("epoch:" + str(record['id'][0]))
-            text_step.set_text("step:" + str(record['id'][1]))
+        def update(record):
+            ax.clear()
+
+            if 'maze_data' in record:
+                self.maze.maze_data = np.array(record['maze_data'], copy=True)
+
+            self.maze.draw_maze()
+
+            x, y = record['state'][0] + 0.5, record['state'][1] + 0.5
+            robot = plt.Circle((y, x), 0.4, color="red")
+            ax.add_patch(robot)
+
+            ax.text(
+                0,
+                -0.1,
+                "epoch:" + str(record['id'][0]),
+                fontsize=20,
+                horizontalalignment='left',
+                verticalalignment="bottom"
+            )
+            ax.text(
+                self.maze.maze_size,
+                -0.1,
+                "step:" + str(record['id'][1]),
+                fontsize=20,
+                horizontalalignment='right',
+                verticalalignment="bottom",
+            )
 
             p_bar.update(1)
-            return robot,
+            return []
 
         def init(): pass  # do nothing
 
@@ -400,13 +412,14 @@ class Runner(object):
             fig,
             update,
             init_func=init,
-            frames=self.train_robot_record,
+            frames=self.test_robot_record,
             interval=200,
             blit=False,
         )
 
         # To save the animation, use e.g.
         ani.save(filename, writer='pillow')
+        self.maze.maze_data = maze_backup
         plt.close()
 
     def plot_results(self):
@@ -415,7 +428,7 @@ class Runner(object):
         plt.title("Success Times")
         plt.plot(np.cumsum(self.train_robot_statics['success']))
         plt.subplot(132)
-        plt.title("Accumulated Rewards")
+        plt.title("Total Return")
         plt.plot(np.array(self.train_robot_statics['reward']))
         plt.subplot(133)
         plt.title("Runing Times per Epoch")
