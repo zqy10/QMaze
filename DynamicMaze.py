@@ -188,6 +188,79 @@ class DynamicMaze(Maze):
             self.maze_data = maze_backup
             plt.close(fig)
 
+    def save_inferred_probabilities_image(self, probability_items, save_path, decimals=2, dpi=150):
+        """
+        基于动态候选图叠加反推概率标注并保存图片。
+        """
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+
+        fig = plt.figure(figsize=(6, 6))
+        maze_backup = self.maze_data
+        self.maze_data = copy.deepcopy(self.base_maze_data)
+
+        probability_lookup = {}
+        for item in probability_items:
+            probability_lookup[item['edge']] = item
+
+        try:
+            Maze.draw_maze(self)
+            ax = plt.gca()
+
+            def draw_edge(i, j, z, color, linewidth=2.6):
+                start_x = j
+                start_y = i
+                if z == 1:
+                    plt.vlines(start_x + 1, start_y, start_y + 1, color=color, linewidth=linewidth)
+                elif z == 2:
+                    plt.hlines(start_y + 1, start_x, start_x + 1, color=color, linewidth=linewidth)
+
+            def edge_text_position(i, j, z):
+                if z == 1:
+                    return j + 1.05, i + 0.5, 'left', 'center'
+                return j + 0.5, i + 1.05, 'center', 'top'
+
+            def draw_probability_text(i, j, z, color):
+                item = probability_lookup.get((i, j, z), None)
+                if item is None:
+                    label = "p_hat=N/A"
+                elif item.get('valid', False):
+                    label = "p_hat={:.{}f}".format(float(item['p_hat']), decimals)
+                else:
+                    label = "p_hat=NaN"
+
+                tx, ty, ha, va = edge_text_position(i, j, z)
+                ax.text(
+                    tx,
+                    ty,
+                    label,
+                    ha=ha,
+                    va=va,
+                    fontsize=7,
+                    color=color,
+                    bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=0.6)
+                )
+
+            for (i, j, z) in self.dynamic_close_doors:
+                draw_edge(i, j, z, color="red")
+                draw_probability_text(i, j, z, color="red")
+
+            for (i, j, z) in self.dynamic_open_doors:
+                draw_edge(i, j, z, color="blue")
+                draw_probability_text(i, j, z, color="blue")
+
+            legend_handles = [
+                Line2D([0], [0], color="red", lw=2.6, label="May Close + inferred p_hat"),
+                Line2D([0], [0], color="blue", lw=2.6, label="May Open + inferred p_hat"),
+            ]
+            plt.legend(handles=legend_handles, loc="lower right")
+
+            fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        finally:
+            self.maze_data = maze_backup
+            plt.close(fig)
+
 if __name__ == "__main__":
     # 实例化迷宫：10x10，设置 5条可能关闭的通路(30%概率)，5面可能打开的墙壁(40%概率)
     dynamic_maze = DynamicMaze(maze_size=10, prob_close=0.3, num_close=5, prob_open=0.4, num_open=5)

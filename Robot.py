@@ -8,26 +8,31 @@ from ReplayDataSet import ReplayDataSet
 from torch_py.QNetwork import QNetwork
 
 class Robot(QRobot):
-    valid_action = ['u', 'r', 'd', 'l']
+    valid_action = ['u', 'r', 'd', 'l', 's']
 
-    def __init__(self, maze):
+    def __init__(self, maze, algorithm='dqn'):
+        self.algorithm = str(algorithm).lower()
+        if self.algorithm not in ('dqn', 'qtable'):
+            raise ValueError("algorithm must be 'dqn' or 'qtable'")
+
         super(Robot, self).__init__(maze)
         self.maze = maze
         self.valid_action = list(maze.valid_actions)
 
         self.maze.set_reward(reward={
-            "hit_wall": -12.0,
-            "destination": 150.0,
-            "default": -2.0,
+            "hit_wall": -32.0,
+            "destination": 80.0,
+            "default": -1.0,
         })
 
         # 算法参数设置
-        epsilon0 = 0.6
+        epsilon0 = 1.0
         self.epsilon0 = epsilon0
         self.epsilon = epsilon0
-        self.epsilon_decay = 0.995
+        self.epsilon_decay = 1.0
         self.epsilon_min = 0.001
         self.gamma = 0.97
+        self.alpha = 0.2
         self.learning_rate = 1e-3
         self.batch_size = 64
         self.distance_weight = 4.0
@@ -36,26 +41,35 @@ class Robot(QRobot):
         self.target_update_interval = self.maze.maze_size * 2 - 3
         self.step_counter = 0
 
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-        # 初始化评估网络与目标网络，状态维度=2(坐标)+动作可行性特征维度
         self.state_size = 2 + len(self.valid_action)
-        self.eval_model = QNetwork(state_size=self.state_size, action_size=len(self.valid_action), seed=21).to(self.device)
-        self.target_model = QNetwork(state_size=self.state_size, action_size=len(self.valid_action), seed=21).to(self.device)
-        self.target_model.load_state_dict(self.eval_model.state_dict())
-        self.target_model.eval() # 目标网络只做前向传播
+        self.device = None
+        self.eval_model = None
+        self.target_model = None
+        self.optimizer = None
+        self.memory = None
 
-        self.optimizer = optim.Adam(self.eval_model.parameters(), lr=self.learning_rate)
+        if self.algorithm == 'dqn':
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            self.eval_model = QNetwork(state_size=self.state_size, action_size=len(self.valid_action), seed=21).to(self.device)
+            self.target_model = QNetwork(state_size=self.state_size, action_size=len(self.valid_action), seed=21).to(self.device)
+            self.target_model.load_state_dict(self.eval_model.state_dict())
+            self.target_model.eval() # 目标网络只做前向传播
 
-        # 初始化经验回放池
-        max_size = max(self.maze.maze_size ** 2 * 3, 10000)
-        self.memory = ReplayDataSet(max_size=max_size)
+            self.optimizer = optim.Adam(self.eval_model.parameters(), lr=self.learning_rate)
+
+            # 初始化经验回放池
+            max_size = max(self.maze.maze_size ** 2 * 3, 10000)
+            self.memory = ReplayDataSet(max_size=max_size)
 
     def reset(self):
         """
         重置机器人并清空单回合访问次数统计。
         """
-        super(Robot, self).reset()
+        self.maze.reset_robot()
+        self.state = self.sense_state()
+        if self.algorithm == 'qtable':
+            state_feature = tuple(self.get_state_feature(self.state))
+            self.create_Qtable_line(state_feature)
 
     def get_state_feature(self, loc):
         """将当前坐标及四周墙壁状态合并为增强状态特征向量。通畅为1，阻挡为0"""
@@ -64,18 +78,30 @@ class Robot(QRobot):
         return tuple(list(loc) + walls)
 
     def _choose_action(self, loc, state_feature, is_train=True):
+        if self.algorithm == 'qtable':
+            state_key = tuple(state_feature)
+            self.create_Qtable_line(state_key)
+
+            if is_train and random.random() < self.epsilon:
+                return random.choice(self.valid_action)
+
+            # Q-Table 贪心动作选择
+            return max(self.q_table[state_key], key=self.q_table[state_key].get)
+
         state_arr = np.array(state_feature)
         state_tensor = torch.from_numpy(state_arr).float().to(self.device)
         
         # 训练时使用 epsilon-greedy 策略增加探索
         if is_train:
             if random.random() < self.epsilon:
-                # 仅在合法动作中探索，减少无效撞墙行为
-                valid_moves = self.maze.can_move_actions(loc)
-                # 极端情况下如果被四面墙封死（动态迷宫），退回使用所有动作
-                if not valid_moves:
-                    valid_moves = self.valid_action
-                return random.choice(valid_moves)
+                # # 仅在合法动作中探索，减少无效撞墙行为
+                # valid_moves = self.maze.can_move_actions(loc)
+                # # 极端情况下如果被四面墙封死（动态迷宫），退回使用所有动作
+                # if not valid_moves:
+                #     valid_moves = self.valid_action
+                # return random.choice(valid_moves)
+                # 直接在所有合法动作中探索，充分与环境交互
+                return random.choice(self.valid_action)
 
             self.eval_model.eval()
             with torch.no_grad():
@@ -89,6 +115,9 @@ class Robot(QRobot):
         return self.valid_action[np.argmax(q_values).item()]
 
     def _learn(self):
+        if self.algorithm != 'dqn':
+            return
+
         # 只有在 Replay Buffer 里的数据足够时才开始训练
         if len(self.memory) < self.batch_size:
             return
@@ -150,6 +179,21 @@ class Robot(QRobot):
             reward = reward - normalized_dist * self.distance_weight
         
         # 3. 存入经验池
+        if self.algorithm == 'qtable':
+            state_key = tuple(state_feature)
+            next_state_key = tuple(next_state_feature)
+            self.create_Qtable_line(state_key)
+            self.create_Qtable_line(next_state_key)
+
+            q_current = self.q_table[state_key][action]
+            q_next = 0.0 if is_terminal else float(max(self.q_table[next_state_key].values()))
+            q_target = reward + self.gamma * q_next
+            self.q_table[state_key][action] = q_current + self.alpha * (q_target - q_current)
+
+            self.step_counter += 1
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+            return action, reward
+
         self.memory.add(state_feature, self.valid_action.index(action), reward, next_state_feature, is_terminal)
 
         # 触发学习

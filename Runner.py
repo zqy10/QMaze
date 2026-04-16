@@ -1,5 +1,5 @@
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, deque
 import torch
 
 from tqdm.auto import tqdm
@@ -11,24 +11,42 @@ from matplotlib import colors as mcolors
 
 
 class Runner(object):
-    def __init__(self, robot):
+    def __init__(
+            self,
+            robot,
+            max_train_records=100,
+            max_test_records=100,
+            max_stat_points=100):
         self.maze = robot.maze
         self.robot = robot
 
-        self.train_robot_record = []
-        self.test_robot_record = []
+        self.train_robot_record = deque(maxlen=max(1, int(max_train_records)))
+        self.test_robot_record = deque(maxlen=max(1, int(max_test_records)))
         self.train_robot_statics = {
-            'success': [],
-            'reward': [],
-            'times': [],
+            'success': deque(maxlen=max(1, int(max_stat_points))),
+            'reward': deque(maxlen=max(1, int(max_stat_points))),
+            'times': deque(maxlen=max(1, int(max_stat_points))),
         }
         self.test_robot_statics = {
-            'success': [],
-            'reward': [],
-            'times': [],
+            'success': deque(maxlen=max(1, int(max_stat_points))),
+            'reward': deque(maxlen=max(1, int(max_stat_points))),
+            'times': deque(maxlen=max(1, int(max_stat_points))),
         }
 
+        self._next_train_epoch_id = 0
+        self._next_test_epoch_id = 0
+
         self.display_direction = False
+
+    def _build_step_record(self, epoch_id, step_id, state, store_snapshot=False):
+        record = {
+            'id': [epoch_id, step_id],
+            'success': False,
+            'state': state,
+        }
+        if store_snapshot:
+            record['maze_data'] = np.array(self.maze.maze_data, copy=True)
+        return record
 
     def _state_q_values(self, state, use_target_model=True):
         """
@@ -42,15 +60,18 @@ class Runner(object):
             normalized_state = np.array(state, dtype=np.float32)
 
         # DQN: 优先使用 target_model（测试更稳定）
-        if use_target_model and hasattr(self.robot, 'target_model'):
-            model = self.robot.target_model
+        target_model = getattr(self.robot, 'target_model', None)
+        eval_model = getattr(self.robot, 'eval_model', None)
+
+        if use_target_model and target_model is not None:
+            model = target_model
             device = getattr(self.robot, 'device', 'cpu')
             state_tensor = torch.from_numpy(normalized_state).float().to(device)
             with torch.no_grad():
                 return model(state_tensor).detach().cpu().numpy()
 
-        if hasattr(self.robot, 'eval_model'):
-            model = self.robot.eval_model
+        if eval_model is not None:
+            model = eval_model
             device = getattr(self.robot, 'device', 'cpu')
             state_tensor = torch.from_numpy(normalized_state).float().to(device)
             with torch.no_grad():
@@ -58,9 +79,14 @@ class Runner(object):
 
         # 传统 Q-table
         if hasattr(self.robot, 'create_Qtable_line') and hasattr(self.robot, 'q_table'):
-            self.robot.create_Qtable_line(state)
+            if getattr(self.robot, 'algorithm', '') == 'qtable' and hasattr(self.robot, 'get_state_feature'):
+                state_key = tuple(self.robot.get_state_feature(state))
+            else:
+                state_key = state
+
+            self.robot.create_Qtable_line(state_key)
             return np.array([
-                self.robot.q_table[state][a] for a in self.robot.valid_action
+                self.robot.q_table[state_key][a] for a in self.robot.valid_action
             ], dtype=float)
 
         raise RuntimeError("Robot does not provide a supported Q-value interface.")
@@ -116,7 +142,276 @@ class Runner(object):
 
         ax.set_title("Max-Q Action and Value per Cell")
         fig.savefig(filename, dpi=150, bbox_inches='tight')
+        fig.clf()
         plt.close(fig)
+        plt.close('all')
+        import gc
+        gc.collect()
+
+    def _distance_penalty(self, loc):
+        """
+        与 Robot.train_update 保持一致的距离惩罚项。
+        """
+        distance_metric = getattr(self.robot, 'distance_metric', 'euclidean')
+        distance_weight = float(getattr(self.robot, 'distance_weight', 0.0))
+
+        dest_x, dest_y = self.maze.destination
+        curr_x, curr_y = loc
+
+        if distance_metric == "euclidean":
+            dist = np.sqrt((curr_x - dest_x) ** 2 + (curr_y - dest_y) ** 2)
+            max_dist = np.sqrt(2) * max(1, (self.maze.maze_size - 1))
+        else:
+            dist = abs(curr_x - dest_x) + abs(curr_y - dest_y)
+            max_dist = max(1, 2 * (self.maze.maze_size - 1))
+
+        normalized_dist = dist / max_dist
+        return normalized_dist * distance_weight
+
+    def _reward_with_shaping(self, next_loc, is_hit_wall):
+        """
+        依据 Robot.train_update 的逻辑构造单步奖励。
+        """
+        if is_hit_wall:
+            base_reward = float(self.maze.reward['hit_wall'])
+        elif next_loc == self.maze.destination:
+            base_reward = float(self.maze.reward['destination'])
+        else:
+            base_reward = float(self.maze.reward['default'])
+
+        # 与训练逻辑一致：仅在非终点时叠加距离惩罚
+        if next_loc != self.maze.destination:
+            base_reward -= self._distance_penalty(next_loc)
+        return base_reward
+
+    def _edge_action_and_states(self, edge):
+        """
+        将候选边 (i, j, z) 映射到动作与通过后的目标状态。
+        """
+        i, j, z = edge
+        if z == 1:
+            return 'r', (i, j), (i, j + 1)
+        if z == 2:
+            return 'd', (i, j), (i + 1, j)
+        raise ValueError("Unsupported edge direction z={}".format(z))
+
+    def _q_values_from_feature(self, feature_state, use_target_model=True):
+        """
+        直接使用特征向量推理 Q 值，用于局部墙状态穷举评估。
+        """
+        feature_arr = np.array(feature_state, dtype=np.float32)
+
+        if getattr(self.robot, 'algorithm', '') == 'qtable':
+            state_key = tuple(float(x) for x in feature_arr.tolist())
+            self.robot.create_Qtable_line(state_key)
+            return np.array([
+                self.robot.q_table[state_key][a] for a in self.robot.valid_action
+            ], dtype=float)
+
+        target_model = getattr(self.robot, 'target_model', None)
+        eval_model = getattr(self.robot, 'eval_model', None)
+
+        if use_target_model and target_model is not None:
+            model = target_model
+        elif eval_model is not None:
+            model = eval_model
+        else:
+            raise RuntimeError("Robot does not provide a DQN model for feature inference.")
+
+        device = getattr(self.robot, 'device', 'cpu')
+        state_tensor = torch.from_numpy(feature_arr).float().to(device)
+        with torch.no_grad():
+            return model(state_tensor).detach().cpu().numpy()
+
+    def infer_dynamic_edge_probabilities(self, use_target_model=True):
+        """
+        反推动态关闭/打开候选边的概率。
+        基于局部墙组合穷举计算 E[V|hit] 与 E[V|pass]，再代入线性解析式求 p。
+        """
+        if not hasattr(self.maze, 'dynamic_close_doors') or not hasattr(self.maze, 'dynamic_open_doors'):
+            return []
+
+        if not hasattr(self.maze, 'base_maze_data'):
+            raise RuntimeError("Dynamic maze is required for probability inference.")
+
+        gamma = float(getattr(self.robot, 'gamma', 0.0))
+        prob_close = float(getattr(self.maze, 'prob_close', 0.0))
+        prob_open = float(getattr(self.maze, 'prob_open', 0.0))
+        close_set = set(self.maze.dynamic_close_doors)
+        open_set = set(self.maze.dynamic_open_doors)
+        rows, cols, _ = self.maze.base_maze_data.shape
+
+        dir_to_index = {'u': 0, 'r': 1, 'd': 2, 'l': 3}
+        direction_order = ['u', 'r', 'd', 'l']
+
+        def canonical_edge(loc, direction):
+            i, j = loc
+            if direction == 'u':
+                if i == 0:
+                    return None
+                return (i - 1, j, 2)
+            if direction == 'r':
+                if j == cols - 1:
+                    return None
+                return (i, j, 1)
+            if direction == 'd':
+                if i == rows - 1:
+                    return None
+                return (i, j, 2)
+            if direction == 'l':
+                if j == 0:
+                    return None
+                return (i, j - 1, 1)
+            raise ValueError("Unsupported direction: {}".format(direction))
+
+        def edge_base_open(edge):
+            if edge is None:
+                return 0.0
+            ei, ej, ez = edge
+            return float(self.maze.base_maze_data[ei, ej, ez])
+
+        def edge_open_probability(edge):
+            if edge in close_set:
+                return 1.0 - prob_close
+            if edge in open_set:
+                return prob_open
+            return edge_base_open(edge)
+
+        def build_feature(loc, open_map):
+            feature = [float(loc[0]), float(loc[1])]
+            for action in self.robot.valid_action:
+                if action in open_map:
+                    feature.append(float(open_map[action]))
+                elif action == 's':
+                    feature.append(1.0)
+                else:
+                    feature.append(0.0)
+            return feature
+
+        def expected_v_with_target_fixed(loc, target_edge, target_open_value):
+            deterministic = {}
+            uncertain = []
+
+            for direction in direction_order:
+                edge = canonical_edge(loc, direction)
+                if edge is None:
+                    deterministic[direction] = 0.0
+                    continue
+
+                if edge == target_edge:
+                    deterministic[direction] = float(target_open_value)
+                    continue
+
+                p_open = edge_open_probability(edge)
+                if p_open <= 0.0:
+                    deterministic[direction] = 0.0
+                elif p_open >= 1.0:
+                    deterministic[direction] = 1.0
+                else:
+                    uncertain.append((direction, p_open))
+
+            expected_v = 0.0
+            num_uncertain = len(uncertain)
+            for mask in range(1 << num_uncertain):
+                open_map = dict(deterministic)
+                prob = 1.0
+
+                for bit in range(num_uncertain):
+                    direction, p_open = uncertain[bit]
+                    open_flag = (mask >> bit) & 1
+                    open_map[direction] = float(open_flag)
+                    prob *= p_open if open_flag else (1.0 - p_open)
+
+                feature = build_feature(loc, open_map)
+                q_values = self._q_values_from_feature(feature, use_target_model=use_target_model)
+                expected_v += prob * float(np.max(q_values))
+
+            return expected_v
+
+        def q_sa_on_base_state(loc, action):
+            open_map = {}
+            for direction in direction_order:
+                edge = canonical_edge(loc, direction)
+                open_map[direction] = edge_base_open(edge)
+
+            feature = build_feature(loc, open_map)
+            q_values = self._q_values_from_feature(feature, use_target_model=use_target_model)
+            action_index = self.robot.valid_action.index(action)
+            return float(q_values[action_index]), feature
+
+        results = []
+
+        def infer_one(edge, edge_type):
+            action, s_state, next_state = self._edge_action_and_states(edge)
+
+            q_sa, base_feature = q_sa_on_base_state(s_state, action)
+
+            reward_hit = self._reward_with_shaping(next_loc=s_state, is_hit_wall=True)
+            reward_pass = self._reward_with_shaping(next_loc=next_state, is_hit_wall=False)
+
+            # 条件期望：hit 分支固定目标边关闭，pass 分支固定目标边打开
+            expected_v_hit = expected_v_with_target_fixed(s_state, target_edge=edge, target_open_value=0.0)
+            expected_v_pass = expected_v_with_target_fixed(next_state, target_edge=edge, target_open_value=1.0)
+
+            g_hit = reward_hit + gamma * expected_v_hit
+            g_pass = reward_pass + gamma * expected_v_pass
+
+            eps = 1e-8
+            if edge_type == 'close':
+                # Q = p_close * G_hit + (1-p_close) * G_pass
+                denom = g_hit - g_pass
+                p_raw = (q_sa - g_pass) / denom if abs(denom) >= eps else np.nan
+            else:
+                # Q = p_open * G_pass + (1-p_open) * G_hit
+                denom = g_pass - g_hit
+                p_raw = (q_sa - g_hit) / denom if abs(denom) >= eps else np.nan
+
+            valid = bool(np.isfinite(p_raw) and abs(denom) >= eps)
+            p_hat = float(np.clip(p_raw, 0.0, 1.0)) if valid else np.nan
+
+            return {
+                'edge': edge,
+                'edge_type': edge_type,
+                'action': action,
+                'state': s_state,
+                'next_state': next_state,
+                'base_feature': tuple(base_feature),
+                'q_sa': q_sa,
+                'reward_hit': reward_hit,
+                'reward_pass': reward_pass,
+                'expected_v_hit': expected_v_hit,
+                'expected_v_pass': expected_v_pass,
+                'g_hit': g_hit,
+                'g_pass': g_pass,
+                'denom': float(denom),
+                'p_raw': float(p_raw) if np.isfinite(p_raw) else np.nan,
+                'p_hat': p_hat,
+                'valid': bool(valid),
+            }
+
+        for edge in self.maze.dynamic_close_doors:
+            results.append(infer_one(edge=edge, edge_type='close'))
+
+        for edge in self.maze.dynamic_open_doors:
+            results.append(infer_one(edge=edge, edge_type='open'))
+
+        return results
+
+    def save_dynamic_probability_image(self, filename, use_target_model=True, decimals=2):
+        """
+        反推候选边概率并保存带标注图片。
+        """
+        if not hasattr(self.maze, 'save_inferred_probabilities_image'):
+            raise RuntimeError("Current maze does not support inferred probability rendering.")
+
+        probability_items = self.infer_dynamic_edge_probabilities(use_target_model=use_target_model)
+        self.maze.save_inferred_probabilities_image(
+            probability_items=probability_items,
+            save_path=filename,
+            decimals=decimals,
+            dpi=150,
+        )
+        return probability_items
 
     def _get_epoch_records(self, epoch_id):
         return [
@@ -209,7 +504,11 @@ class Runner(object):
         ax.legend(loc='lower right')
 
         fig.savefig(filename, dpi=150, bbox_inches='tight')
+        fig.clf()
         plt.close(fig)
+        plt.close('all')
+        import gc
+        gc.collect()
 
     def _build_compact_display_points(self, trajectory):
         """
@@ -267,16 +566,17 @@ class Runner(object):
     def run_training(self, training_epoch, training_per_epoch=150, epoch_image_dir=None):
         epoch_iter = tqdm(range(training_epoch), desc="Training", leave=True)
         for e in epoch_iter:
+            epoch_id = self._next_train_epoch_id + e
             total_return = 0
             run_times = 0
             for i in range(training_per_epoch):
 
-                current_record = {
-                    'id': [e, i],
-                    'success': False,
-                    'state': self.maze.sense_robot(),
-                    'maze_data': np.array(self.maze.maze_data, copy=True),
-                }
+                current_record = self._build_step_record(
+                    epoch_id=epoch_id,
+                    step_id=i,
+                    state=self.maze.sense_robot(),
+                    store_snapshot=False
+                )
 
                 if current_record['state'] == self.maze.destination:
                     current_record['success'] = True
@@ -286,7 +586,6 @@ class Runner(object):
                 action, reward = self.robot.train_update()
                 current_record['action'] = action
                 current_record['reward'] = reward
-                current_record['maze_data'] = np.array(self.maze.maze_data, copy=True)
                 self.train_robot_record.append(current_record)
 
                 run_times += 1
@@ -303,37 +602,33 @@ class Runner(object):
                 import os
                 os.makedirs(epoch_image_dir, exist_ok=True)
                 self.save_epoch_image(
-                    epoch_id=e,
+                    epoch_id=epoch_id,
                     filename=os.path.join(epoch_image_dir, "epoch_{:04d}.png".format(e))
                 )
 
             self.robot.reset()
+
+        self._next_train_epoch_id += int(training_epoch)
 
     def run_testing(self, testing_epoch=1, testing_per_epoch=None, epoch_image_dir=None):
         height, width, _ = self.maze.maze_data.shape
         if testing_per_epoch is None:
             testing_per_epoch = int(height * width * 0.85)
 
-        existing_test_epochs = [
-            record['id'][0] for record in self.test_robot_record
-            if 'id' in record and isinstance(record['id'], list) and len(record['id']) == 2
-        ]
-        epoch_base = max(existing_test_epochs) + 1 if existing_test_epochs else 0
-
         for e in range(testing_epoch):
             self.robot.reset()
-            epoch_id = epoch_base + e
+            epoch_id = self._next_test_epoch_id + e
 
             accumulated_reward = 0.
             run_times = 0
 
             for i in range(testing_per_epoch):
-                current_record = {
-                    'id': [epoch_id, i],
-                    'success': False,
-                    'state': self.maze.sense_robot(),
-                    'maze_data': np.array(self.maze.maze_data, copy=True),
-                }
+                current_record = self._build_step_record(
+                    epoch_id=epoch_id,
+                    step_id=i,
+                    state=self.maze.sense_robot(),
+                    store_snapshot=True
+                )
 
                 if current_record['state'] == self.maze.destination:
                     current_record['success'] = True
@@ -358,6 +653,8 @@ class Runner(object):
                     epoch_id=epoch_id,
                     filename=os.path.join(epoch_image_dir, "test_epoch_{:04d}.png".format(epoch_id))
                 )
+
+        self._next_test_epoch_id += int(testing_epoch)
 
     def __init_gif(self):
         fig, ax = plt.subplots(figsize=(6, 6))
@@ -420,7 +717,11 @@ class Runner(object):
         # To save the animation, use e.g.
         ani.save(filename, writer='pillow')
         self.maze.maze_data = maze_backup
-        plt.close()
+        fig.clf()
+        plt.close(fig)
+        plt.close('all')
+        import gc
+        gc.collect()
 
     def plot_results(self):
         plt.figure(figsize=(12, 4))
