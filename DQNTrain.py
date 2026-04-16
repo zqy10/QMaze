@@ -15,7 +15,7 @@ def train_by_dqn_robot(times, maze_size=5):
     print("start times:", times)
 
     # maze = Maze(maze_size=maze_size)
-    maze = DynamicMaze(maze_size=maze_size, prob_close=0.7, num_close=maze_size, prob_open=0.3, num_open=maze_size)
+    maze = DynamicMaze(maze_size=maze_size, prob_close=0.3, num_close=maze_size, prob_open=0.8, num_open=maze_size)
     maze.save_dynamic_candidates_image("results/size{}/dynamic_candidates.png".format(maze_size))
 
     """choose Keras or Torch version"""
@@ -31,7 +31,7 @@ def train_by_dqn_robot(times, maze_size=5):
     # runner.run_training(100, 100, "results/size{}/train/".format(maze_size))、
     runner.run_training(
         training_epoch=10000,
-        training_per_epoch=200,
+        training_per_epoch=300,
         epoch_image_dir=None,
     )
     runner.save_max_q_image("results/size{}/max_q_map.png".format(maze_size), use_target_model=True)

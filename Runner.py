@@ -226,7 +226,7 @@ class Runner(object):
     def infer_dynamic_edge_probabilities(self, use_target_model=True):
         """
         反推动态关闭/打开候选边的概率。
-        基于局部墙组合穷举计算 E[V|hit] 与 E[V|pass]，再代入线性解析式求 p。
+        基于局部墙组合穷举计算 E[V|hit] 与 E[V|pass]，采用迭代式估计（EM思想）避免使用环境真实概率。
         """
         if not hasattr(self.maze, 'dynamic_close_doors') or not hasattr(self.maze, 'dynamic_open_doors'):
             return []
@@ -235,14 +235,19 @@ class Runner(object):
             raise RuntimeError("Dynamic maze is required for probability inference.")
 
         gamma = float(getattr(self.robot, 'gamma', 0.0))
-        prob_close = float(getattr(self.maze, 'prob_close', 0.0))
-        prob_open = float(getattr(self.maze, 'prob_open', 0.0))
         close_set = set(self.maze.dynamic_close_doors)
         open_set = set(self.maze.dynamic_open_doors)
         rows, cols, _ = self.maze.base_maze_data.shape
 
         dir_to_index = {'u': 0, 'r': 1, 'd': 2, 'l': 3}
         direction_order = ['u', 'r', 'd', 'l']
+
+        # 初始化估计的边开通概率
+        estimated_open_probs = {}
+        for edge in close_set:
+            estimated_open_probs[edge] = 0.5
+        for edge in open_set:
+            estimated_open_probs[edge] = 0.5
 
         def canonical_edge(loc, direction):
             i, j = loc
@@ -271,10 +276,8 @@ class Runner(object):
             return float(self.maze.base_maze_data[ei, ej, ez])
 
         def edge_open_probability(edge):
-            if edge in close_set:
-                return 1.0 - prob_close
-            if edge in open_set:
-                return prob_open
+            if edge in estimated_open_probs:
+                return estimated_open_probs[edge]
             return edge_base_open(edge)
 
         def build_feature(loc, open_map):
@@ -339,8 +342,6 @@ class Runner(object):
             action_index = self.robot.valid_action.index(action)
             return float(q_values[action_index]), feature
 
-        results = []
-
         def infer_one(edge, edge_type):
             action, s_state, next_state = self._edge_action_and_states(edge)
 
@@ -389,11 +390,26 @@ class Runner(object):
                 'valid': bool(valid),
             }
 
-        for edge in self.maze.dynamic_close_doors:
-            results.append(infer_one(edge=edge, edge_type='close'))
+        max_iters = 10
+        results = []
+        for iteration in range(max_iters):
+            results = []
+            
+            for edge in self.maze.dynamic_close_doors:
+                res = infer_one(edge=edge, edge_type='close')
+                results.append(res)
+                if res['valid']:
+                    new_p_open = 1.0 - res['p_hat']
+                    # 平滑更新
+                    estimated_open_probs[edge] = 0.5 * estimated_open_probs[edge] + 0.5 * new_p_open
 
-        for edge in self.maze.dynamic_open_doors:
-            results.append(infer_one(edge=edge, edge_type='open'))
+            for edge in self.maze.dynamic_open_doors:
+                res = infer_one(edge=edge, edge_type='open')
+                results.append(res)
+                if res['valid']:
+                    new_p_open = res['p_hat']
+                    # 平滑更新
+                    estimated_open_probs[edge] = 0.5 * estimated_open_probs[edge] + 0.5 * new_p_open
 
         return results
 
