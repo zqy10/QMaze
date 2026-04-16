@@ -282,11 +282,10 @@ class Runner(object):
 
         def build_feature(loc, open_map):
             feature = [float(loc[0]), float(loc[1])]
-            for action in self.robot.valid_action:
-                if action in open_map:
-                    feature.append(float(open_map[action]))
-                elif action == 's':
-                    feature.append(1.0)
+            wall_directions = getattr(self.robot, 'wall_directions', ['u', 'r', 'd', 'l'])
+            for direction in wall_directions:
+                if direction in open_map:
+                    feature.append(float(open_map[direction]))
                 else:
                     feature.append(0.0)
             return feature

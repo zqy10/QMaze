@@ -9,6 +9,7 @@ from torch_py.QNetwork import QNetwork
 
 class Robot(QRobot):
     valid_action = ['u', 'r', 'd', 'l', 's']
+    wall_directions = ['u', 'r', 'd', 'l']
 
     def __init__(self, maze, algorithm='dqn'):
         self.algorithm = str(algorithm).lower()
@@ -29,8 +30,8 @@ class Robot(QRobot):
         epsilon0 = 1.0
         self.epsilon0 = epsilon0
         self.epsilon = epsilon0
-        self.epsilon_decay = 1.0
-        self.epsilon_min = 0.001
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.01
         self.gamma = 0.97
         self.alpha = 0.2
         self.learning_rate = 1e-3
@@ -41,7 +42,8 @@ class Robot(QRobot):
         self.target_update_interval = self.maze.maze_size * 2 - 3
         self.step_counter = 0
 
-        self.state_size = 2 + len(self.valid_action)
+        # 固定状态维度：坐标2维 + 四个方向墙体通断4维
+        self.state_size = 6
         self.device = None
         self.eval_model = None
         self.target_model = None
@@ -74,7 +76,7 @@ class Robot(QRobot):
     def get_state_feature(self, loc):
         """将当前坐标及四周墙壁状态合并为增强状态特征向量。通畅为1，阻挡为0"""
         valid_moves = self.maze.can_move_actions(loc)
-        walls = [1.0 if a in valid_moves else 0.0 for a in self.valid_action]
+        walls = [1.0 if a in valid_moves else 0.0 for a in self.wall_directions]
         return tuple(list(loc) + walls)
 
     def _choose_action(self, loc, state_feature, is_train=True):

@@ -31,7 +31,7 @@ def train_by_dqn_robot(times, maze_size=5):
     # runner.run_training(100, 100, "results/size{}/train/".format(maze_size))、
     runner.run_training(
         training_epoch=10000,
-        training_per_epoch=300,
+        training_per_epoch=500,
         epoch_image_dir=None,
     )
     runner.save_max_q_image("results/size{}/max_q_map.png".format(maze_size), use_target_model=True)
