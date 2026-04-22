@@ -1,0 +1,9 @@
+{
+  "steps": 5000,
+  "configured_prob_close": 0.3,
+  "configured_prob_open": 0.7,
+  "expected_open_for_close_edges": 0.7,
+  "expected_open_for_open_edges": 0.7,
+  "empirical_open_for_close_edges_mean": 0.7013333333333334,
+  "empirical_open_for_open_edges_mean": 0.6951999999999999
+}
