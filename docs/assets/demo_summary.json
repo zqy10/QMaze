@@ -1,0 +1,17 @@
+{
+  "maze_size": 6,
+  "prob_close": 0.3,
+  "prob_open": 0.7,
+  "train_epochs": 300,
+  "train_steps_cap": 80,
+  "final_success_cumsum": 100,
+  "avg_return_last50": -0.02977290679794237,
+  "avg_steps_last50": 14.22,
+  "test_success": 1,
+  "test_discounted_return": 24.166996198357587,
+  "test_steps": 12,
+  "dynamic_prob_valid_count": 12,
+  "dynamic_prob_total": 12,
+  "dynamic_prob_close_mean": 0.21318161318899964,
+  "dynamic_prob_open_mean": 0.4850528652278084
+}
